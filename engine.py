@@ -15,7 +15,7 @@ import time
 import numpy as np
 import pandas as pd
 
-ENGINE_VERSION = "V1.0（量化門檻 V0.1・測試中）"
+ENGINE_VERSION = "V1.2（量化門檻 V0.2・測試中）"
 
 # ------------------------------------------------------------------
 # 量化門檻（測試中 V0.1）
@@ -33,6 +33,17 @@ TH = {
     "retest_days": 10,    # 突破後 10 日內的回測買點
     "retest_hold": 0.97,  # 回測不可跌破突破價 3% 以上
     "limit": 9.5,         # 漲跌停判定（%）
+    # ---- V1.2 新增 ----
+    "atr_min": 1.2,       # 股性：ATR14 占股價 % 下限（太小 → 15 日內難達 3%）
+    "atr_max": 4.5,       # 股性：ATR14 占股價 % 上限（太大 → 停損距離過大）
+    "limit_buffer": 0.005,  # 拉回限價＝突破價 × 1.005
+    "limit_valid": 3,     # 限價單有效交易日數
+    "stop_atr": 0.5,      # 拉回限價的停損＝突破價 − 0.5 × ATR（跌回突破價下＝假突破）
+    "no_chase": 0.01,     # 收盤型買點：隔日開盤高於收盤 1% 以上不追
+    "b_pull_min": 0.03,   # 策略B：自近 10 日高點回檔至少 3%
+    "b_pull_max": 0.12,   # 策略B：回檔不超過 12%
+    "b_touch": 0.015,     # 策略B：回檔低點需觸及 MA10/MA20 的 1.5% 以內
+    "b_vr": 1.2,          # 策略B：觸發紅 K 量比 ≥ 1.2
 }
 
 PATTERNS = {
@@ -286,6 +297,10 @@ class Analyzer:
         d["hi60"] = d["high"].rolling(60).max()
         d["lo60"] = d["low"].rolling(60).min()
         d["pos60"] = (c - d["lo60"]) / (d["hi60"] - d["lo60"]).replace(0, np.nan)
+        prev_c = c.shift(1)
+        tr = pd.concat([d["high"] - d["low"], (d["high"] - prev_c).abs(), (d["low"] - prev_c).abs()], axis=1).max(axis=1)
+        d["atr"] = tr.ewm(alpha=1 / 14, adjust=False).mean()
+        d["atrp"] = d["atr"] / c * 100
         d["hh20p"] = d["high"].shift(1).rolling(20).max()
         d["ll20p"] = d["low"].shift(1).rolling(20).min()
 
@@ -298,6 +313,7 @@ class Analyzer:
         self.K, self.D, self.HIST = g("k"), g("d"), g("hist")
         self.HI60, self.LO60, self.POS60 = g("hi60"), g("lo60"), g("pos60")
         self.HH20P, self.LL20P = g("hh20p"), g("ll20p")
+        self.ATR, self.ATRP = g("atr"), g("atrp")
         self.dates = [x.strftime("%Y-%m-%d") for x in d.index]
 
     def _pivots(self):
@@ -350,7 +366,7 @@ class Analyzer:
 
         # 1 低檔大量長紅K
         if self.low_zone(i) and self.long_red(i) and self.burst(i):
-            add(1, O[i], L[i], "低檔爆量長紅")
+            add(1, (O[i] + C[i]) / 2, L[i], "低檔爆量長紅（突破價取長紅 1/2）")
 
         # 2 破切反彈過高 / 7 空轉多過空高
         hs = self.conf_highs(i - 1)
@@ -542,31 +558,102 @@ class Analyzer:
         lv = sorted(self.H[k] for k in hs if self.H[k] > price * 1.001)
         return float(lv[0]) if lv else None
 
-    # ---------------- 進場訊號（突破型 / 回測型） ----------------
-    def signal(self, i):
-        """回傳第 i 天收盤後的進場訊號，沒有則 None。"""
-        cand = []
+    # ---------------- 進場訊號（V1.2：四種買點） ----------------
+    def strategy_b(self, i):
+        """策略 B：多頭回檔 → 觸及 MA10/MA20 支撐不破月線 → 第一根帶量紅 K。"""
+        C, H, L = self.C, self.H, self.L
+        if not (self.MA20[i] > self.MA60[i] and self.MA20[i] > self.MA20[i - 5] and C[i] > self.MA60[i]):
+            return None
+        if self.structure(i)["state"].startswith("空頭"):
+            return None
+        pk = i - 10 + int(np.argmax(H[i - 10:i]))
+        if pk >= i - 1:
+            return None
+        seg = L[pk + 1:i + 1]
+        kl = pk + 1 + int(np.argmin(seg))
+        pb = float(seg.min())
+        depth = 1 - pb / H[pk]
+        if not (TH["b_pull_min"] <= depth <= TH["b_pull_max"]):
+            return None
+        sup = max(self.MA10[kl], self.MA20[kl])
+        if pb > sup * (1 + TH["b_touch"]):
+            return None
+        if any(C[k] < self.MA20[k] * 0.98 for k in range(pk + 1, i + 1)):
+            return None
+        trig = lambda k: self.red(k) and C[k] > H[k - 1] and self.VR[k] >= TH["b_vr"]
+        if not trig(i) or any(trig(k) for k in range(kl + 1, i)):
+            return None
+        stop = float(min(L[i], L[i - 1]))  # 跌破止跌 K（前一日與觸發紅 K）最低點＝失敗
+        return {"type": "多頭回檔買上漲（策略B）", "mode": "close", "entry": float(C[i]), "stop": stop,
+                "ref": float(H[i - 1]), "ids": [], "src": self.dates[i],
+                "note": f"自 {H[pk]:g} 回檔 {depth * 100:.1f}% 至 MA10/MA20 支撐後首根帶量紅K"}
+
+    def candidates(self, i, live=True):
+        """第 i 天收盤後所有可能的買點。live=True 時，含 1～2 天前突破、仍在有效期的限價單。"""
+        C, L = self.C, self.L
+        out = []
+        ids = lambda j: [h["id"] for h in self.hits[j]]
+        # A. 突破收盤買（積極）
         if self.hits[i]:
-            stop = max(h["stop"] for h in self.hits[i])
-            cand.append({"type": "突破型（積極／確認買點）", "stop": stop,
-                         "ref": max(h["ref"] for h in self.hits[i]),
-                         "ids": [h["id"] for h in self.hits[i]]})
+            out.append({"type": "突破收盤買（積極）", "mode": "close", "entry": float(C[i]),
+                        "stop": max(h["stop"] for h in self.hits[i]),
+                        "ref": max(h["ref"] for h in self.hits[i]), "ids": ids(i), "src": self.dates[i]})
+        # B. 拉回限價買（突破後掛單，3 日有效）
+        lo = i - (TH["limit_valid"] - 1) if live else i
+        for j in range(i, max(70, lo) - 1, -1):
+            if not self.hits[j]:
+                continue
+            ref = max(h["ref"] for h in self.hits[j])
+            limit = min(round_up(ref * (1 + TH["limit_buffer"]), self.etf), float(C[j]))
+            stop = ref - TH["stop_atr"] * self.ATR[j]
+            if j < i and (L[j + 1:i + 1].min() <= limit or C[j + 1:i + 1].min() < stop):
+                break  # 已成交或已跌破 → 單子失效
+            out.append({"type": "拉回限價買（突破後掛單）", "mode": "limit", "entry": float(limit),
+                        "stop": float(stop), "ref": ref, "ids": ids(j), "src": self.dates[j],
+                        "days_left": TH["limit_valid"] - (i - j)})
+            break
+        # C. 回測確認買（保守）
         for j in range(i - 2, max(70, i - TH["retest_days"]) - 1, -1):
             if not self.hits[j]:
                 continue
             ref = max(h["ref"] for h in self.hits[j])
-            pb = self.L[j + 1:i + 1].min()
-            if (pb >= ref * TH["retest_hold"] and pb < self.C[j]
-                    and self.C[i] > self.O[i] and self.C[i] > self.H[i - 1] and self.C[i] >= ref):
-                cand.append({"type": "回測型（保守買點）", "stop": float(pb), "ref": ref,
-                             "ids": [h["id"] for h in self.hits[j]], "from": self.dates[j]})
+            pb = L[j + 1:i + 1].min()
+            if (pb >= ref * TH["retest_hold"] and pb < C[j]
+                    and C[i] > self.O[i] and C[i] > self.H[i - 1] and C[i] >= ref):
+                out.append({"type": "回測確認買（保守）", "mode": "close", "entry": float(C[i]),
+                            "stop": float(pb), "ref": ref, "ids": ids(j), "src": self.dates[j]})
             break
-        if not cand:
+        # D. 策略 B（收盤買）
+        b = self.strategy_b(i)
+        if b:
+            out.append(b)
+        # E. 策略 B 掛單：觸發紅 K 後拉回實體 1/2 買，停損同止跌 K 低點
+        for j in range(i, max(70, lo) - 1, -1):
+            bj = b if j == i else self.strategy_b(j)
+            if not bj:
+                continue
+            limit = min(round_up((self.O[j] + C[j]) / 2, self.etf), float(C[j]))
+            if j < i and (L[j + 1:i + 1].min() <= limit or C[j + 1:i + 1].min() < bj["stop"]):
+                break
+            out.append({**bj, "type": "多頭回檔掛單（策略B）", "mode": "limit", "entry": float(limit),
+                        "src": self.dates[j], "days_left": TH["limit_valid"] - (i - j)})
+            break
+        return [c for c in out if c["stop"] < c["entry"]]
+
+    def signal(self, i):
+        """相容舊介面：回傳風報比最好的候選。"""
+        cs = self.candidates(i)
+        return max(cs, key=lambda c: self.plan(i, c["entry"], c["stop"])["rr"]) if cs else None
+
+    def suitability(self, i):
+        ap = self.ATRP[i]
+        if not np.isfinite(ap):
             return None
-        cand = [c for c in cand if c["stop"] < self.C[i]]
-        if not cand:
-            return None
-        return max(cand, key=lambda c: c["stop"])  # 停損最近（風報比最好）者
+        if ap > TH["atr_max"]:
+            return f"股性波動過大（日均波動 ATR {ap:.1f}% > {TH['atr_max']}%），停損距離難以配合 {self.p['target_net']:g}% 目標"
+        if ap < TH["atr_min"]:
+            return f"股性波動過小（ATR {ap:.1f}% < {TH['atr_min']}%），{self.p['hold_days']} 日內不易達 {self.p['target_net']:g}%"
+        return None
 
     def vetoes(self, i, st=None):
         v = []
@@ -596,9 +683,13 @@ class Analyzer:
                 "profit": shares * (tp3 * (1 - self.sell_c) - per_share_cost),
                 "resistance": res}
 
-    def tradable(self, i, sig, entry):
-        """風控檢查：否決條件、風報比、上方壓力。回傳 (可否, 原因列表)。"""
+    def tradable(self, i, sig, entry=None):
+        """風控檢查：否決條件、股性、風報比、上方壓力。回傳 (可否, 原因列表, 計畫)。"""
+        entry = sig["entry"] if entry is None else entry
         reasons = list(self.vetoes(i))
+        su = self.suitability(i)
+        if su:
+            reasons.append(su)
         pl = self.plan(i, entry, sig["stop"])
         if pl["rr"] < self.p["min_rr"]:
             reasons.append(f"停損距離過大（淨虧 {pl['loss_pct']:.2f}%），風報比 {pl['rr']:.2f} < {self.p['min_rr']}")
@@ -607,52 +698,112 @@ class Analyzer:
         return (not reasons), reasons, pl
 
     # ---------------- 回測 ----------------
+    FUNNEL_ORDER = ["出現訊號", "否決（跌停／破底／衰退）", "股性不符", "風報比不足", "上方壓力太近",
+                    "開高不追", "漲停買不到", "開低破停損", "限價未成交", "成交"]
+
+    @staticmethod
+    def _reason_key(r):
+        if "股性" in r:
+            return "股性不符"
+        if "風報比" in r:
+            return "風報比不足"
+        if "壓力" in r:
+            return "上方壓力太近"
+        return "否決（跌停／破底／衰退）"
+
+    def _locked_up(self, e):
+        return self.O[e] == self.H[e] == self.L[e] and self.CHG[e] >= TH["limit"]
+
+    def _simulate(self, i, c, hold):
+        """回傳 (交易 dict 或 None, 出場 index, 未成交原因)。資料不足回傳 (None, None, None)。"""
+        O, H, L, C, n = self.O, self.H, self.L, self.C, self.n
+        stop = round_down(c["stop"], self.etf)
+        if c["mode"] == "close":
+            e = i + 1
+            if e >= n:
+                return None, None, None
+            if self._locked_up(e):
+                return None, None, "漲停買不到"
+            if O[e] > C[i] * (1 + TH["no_chase"]):
+                return None, None, "開高不追"
+            if O[e] <= stop:
+                return None, None, "開低破停損"
+            entry, start = float(O[e]), e
+        else:
+            limit, start = c["entry"], None
+            for e in range(i + 1, min(i + 1 + TH["limit_valid"], n)):
+                if O[e] <= limit:
+                    entry, start = float(O[e]), e
+                    break
+                if L[e] <= limit:
+                    entry, start = float(limit), e
+                    break
+            if start is None:
+                return (None, None, "限價未成交") if i + TH["limit_valid"] < n else (None, None, None)
+        tp = target_price(entry, self.p["target_net"], self.buy_c, self.sell_c, self.etf)
+        last = start + hold - 1
+        if last >= n:
+            return None, None, None
+        exit_ = why = xj = None
+        mae = mfe = 0.0
+        for j in range(start, last + 1):
+            mae = min(mae, L[j] / entry - 1)
+            mfe = max(mfe, H[j] / entry - 1)
+            if O[j] <= stop and (j > start or c["mode"] == "limit"):
+                exit_, why, xj = float(min(O[j], entry if j == start else O[j])), "停損（跳空）", j
+                break
+            if L[j] <= stop:
+                exit_, why, xj = float(stop), "停損", j
+                break
+            if c["mode"] == "limit" and j == start:
+                continue  # 掛單成交當天保守處理：不計停利
+            if H[j] >= tp:
+                exit_, why, xj = float(O[j] if O[j] >= tp else tp), "停利", j
+                break
+        if exit_ is None:
+            exit_, why, xj = float(C[last]), "期滿", last
+        tag = "、".join(PATTERNS[k] for k in c["ids"]) or c.get("note", "")[:12]
+        return {
+            "訊號日": self.dates[i], "進場日": self.dates[start], "進場價": round(entry, 2),
+            "停損": stop, "停利": tp, "出場日": self.dates[xj], "出場價": round(exit_, 2),
+            "結果": why, "淨報酬%": round(net_return(entry, exit_, self.buy_c, self.sell_c), 2),
+            "持有天數": xj - start + 1, "最大不利%": round(mae * 100, 2), "最大有利%": round(mfe * 100, 2),
+            "買點": c["type"].split("（")[0], "型態": tag,
+        }, xj, None
+
     def backtest(self):
         hold = int(self.p["hold_days"])
-        trades = []
+        trades, funnel = [], {k: 0 for k in self.FUNNEL_ORDER}
         i = 70
         while i < self.n - 1:
-            sig = self.signal(i)
-            if sig is None:
+            cs = self.candidates(i, live=False)
+            if not cs:
                 i += 1
                 continue
-            ok, _, _ = self.tradable(i, sig, self.C[i])
-            if not ok:
+            funnel["出現訊號"] += 1
+            passing, first = [], None
+            for c in cs:
+                ok, why, pl = self.tradable(i, c)
+                if ok:
+                    passing.append((pl["rr"], c))
+                elif first is None:
+                    first = why[0]
+            if not passing:
+                funnel[self._reason_key(first)] += 1
                 i += 1
                 continue
-            e = i + 1
-            entry = self.O[e]
-            stop = round_down(sig["stop"], self.etf)
-            if entry <= stop:
+            c = max(passing, key=lambda x: x[0])[1]
+            t, xj, miss = self._simulate(i, c, hold)
+            if t is None and miss is None:
+                break  # 資料尾端，交易尚未結束
+            if t is None:
+                funnel[miss] += 1
                 i += 1
                 continue
-            tp = target_price(entry, self.p["target_net"], self.buy_c, self.sell_c, self.etf)
-            last = i + hold
-            if last >= self.n:
-                break  # 尚未結束的交易不計入
-            exit_, why, xj = None, None, None
-            mae = 0.0
-            for j in range(e, last + 1):
-                mae = min(mae, self.L[j] / entry - 1)
-                if j > e and self.O[j] <= stop:
-                    exit_, why, xj = self.O[j], "停損（跳空）", j
-                    break
-                if self.L[j] <= stop:
-                    exit_, why, xj = stop, "停損", j
-                    break
-                if self.H[j] >= tp:
-                    exit_, why, xj = (self.O[j] if j > e and self.O[j] >= tp else tp), "停利", j
-                    break
-            if exit_ is None:
-                exit_, why, xj = self.C[last], "期滿", last
-            trades.append({
-                "訊號日": self.dates[i], "進場日": self.dates[e], "進場價": round(entry, 2),
-                "停損": stop, "停利": tp, "出場日": self.dates[xj], "出場價": round(float(exit_), 2),
-                "結果": why, "淨報酬%": round(net_return(entry, exit_, self.buy_c, self.sell_c), 2),
-                "持有天數": xj - e + 1, "最大不利%": round(mae * 100, 2),
-                "型態": "、".join(PATTERNS[k] for k in sig["ids"]), "買點": sig["type"][:3],
-            })
+            funnel["成交"] += 1
+            trades.append(t)
             i = xj + 1
+        self.funnel = funnel
         return pd.DataFrame(trades)
 
     @staticmethod
@@ -684,7 +835,18 @@ class Analyzer:
         st = self.structure(i)
         stage, stage_txt = self.lifecycle(i, st)
         dec = self.decline(i)
-        sig = self.signal(i)
+        cands = self.candidates(i, live=True)
+        evals = [(c,) + self.tradable(i, c) for c in cands]  # (c, ok, why, pl)
+        passing = [e for e in evals if e[1]]
+        if passing:
+            sig, ok, why, pl = max(passing, key=lambda e: e[3]["rr"])
+        elif evals:
+            sig, ok, why, pl = max(evals, key=lambda e: e[3]["rr"])
+        else:
+            sig, ok, why, pl = None, False, list(self.vetoes(i)), None
+            su0 = self.suitability(i)
+            if su0:
+                why.append(su0)
         bt = self.backtest()
         stats = self.summarize(bt)
         enough = stats["n"] >= 30
@@ -704,7 +866,7 @@ class Analyzer:
             mod("01", "市場環境", None, "無法取得加權指數，無法判定；產業與法人資料未納入")
         mod("02", "趨勢結構", st["score"],
             st["state"] + (f"；前高 {st['last_high']:g}、前低 {st['last_low']:g}" if st["last_high"] else ""))
-        if self.hits[i] or (sig and "回測" in sig["type"]):
+        if self.hits[i] or any(("回測" in c["type"] or "拉回" in c["type"]) for c in cands):
             s3 = 1.0
         elif recent:
             s3 = 0.5
@@ -730,7 +892,8 @@ class Analyzer:
         ma_ok = C[i] >= self.MA20[i]
         s6 = 1.0 if ma_ok and self.MA20[i] >= self.MA60[i] else 0.5 if ma_ok else 0.0
         mod("06", "均線與支撐壓力", s6,
-            f"MA5 {self.MA5[i]:.2f}／MA10 {self.MA10[i]:.2f}／MA20 {self.MA20[i]:.2f}／MA60 {self.MA60[i]:.2f}")
+            f"MA5 {self.MA5[i]:.2f}／MA10 {self.MA10[i]:.2f}／MA20 {self.MA20[i]:.2f}／MA60 {self.MA60[i]:.2f}"
+            + (f"；股性 ATR {self.ATRP[i]:.1f}%" if np.isfinite(self.ATRP[i]) else ""))
         mom = [self.K[i] > self.D[i], self.HIST[i] > self.HIST[i - 1],
                40 <= self.df["rsi14"].iloc[i] <= 75]
         s7 = 1.0 if sum(mom) >= 2 else 0.5 if sum(mom) == 1 else 0.0
@@ -747,11 +910,8 @@ class Analyzer:
 
         # ---- 決策 ----
         entry = float(C[i])
-        if sig:
-            ok, why, pl = self.tradable(i, sig, entry)
-        else:
-            ok, why, pl = False, list(self.vetoes(i)), None
-        s10 = 0.0 if why and any(("跌停" in w or "破底" in w or "衰退" in w or "風報比" in w) for w in why) else (1.0 if ok else 0.5)
+        why = list(why)
+        s10 = 0.0 if why and any(k in w for w in why for k in ("跌停", "破底", "衰退", "風報比", "股性")) else (1.0 if ok else 0.5)
         mod("10", "風控與資金管理", s10, "；".join(why) if why else ("通過" if ok else "尚無進場訊號"))
 
         avail = [m["score"] for m in mods if m["score"] is not None]
@@ -769,10 +929,13 @@ class Analyzer:
             pl["cost"] = pl["shares"] * per
             pl["max_loss"] = pl["shares"] * (per - pl["stop"] * (1 - self.sell_c))
             pl["profit"] = pl["shares"] * (pl["tp3"] * (1 - self.sell_c) - per)
+        unsuitable = self.suitability(i)
         if ok:
-            decision, color = "可進場", "green"
+            decision, color = ("可進場（掛單）" if sig["mode"] == "limit" else "可進場"), "green"
         elif self.vetoes(i):
             decision, color = "不可進場", "red"
+        elif unsuitable:
+            decision, color = "不適合本策略", "red"
         else:
             decision, color = "等待", "orange"
 
@@ -784,7 +947,12 @@ class Analyzer:
                      if x is not None and np.isfinite(x) and x > C[i]]
             lvl = round_up(min(cands) * 1.0001, self.etf) if cands else round_up(self.H[i] * 1.0001, self.etf)
             conf = st["last_high"] if st["last_high"] and st["last_high"] > lvl else None
-            if self.vetoes(i) and not (sig and ok):
+            bull = self.MA20[i] > self.MA60[i] and self.MA20[i] > self.MA20[i - 5] and C[i] > self.MA60[i]
+            if unsuitable:
+                text = (f"這檔股票日均波動約 {self.ATRP[i]:.1f}%，與「{self.p['hold_days']} 日內淨賺 "
+                        f"{self.p['target_net']:g}%」的策略不匹配，系統不提供買點。"
+                        f"本策略適合日均波動 {TH['atr_min']}%～{TH['atr_max']}% 的股票。")
+            elif self.vetoes(i) and not (sig and ok):
                 text = ("① 先等止跌：某天不跌停、不創新低，且收在當日區間上半部（止跌 K）。"
                         f"② 積極買點：之後收盤突破止跌 K 最高價、收紅、量 ≥ {vneed:,.0f} 張；停損 = 止跌 K 最低價。")
                 if conf:
@@ -794,7 +962,11 @@ class Analyzer:
                         "保守買點：突破後回測不破突破價、再出紅 K。")
                 if conf:
                     text += f" 前波高點 {conf:g} 為上方壓力。"
-            text += " 觸發當天收盤後再分析一次確認風報比。"
+                if bull:
+                    text += (f" 多頭回檔買點（策略B）：拉回 MA10 {self.MA10[i]:.2f}～MA20 {self.MA20[i]:.2f} 一帶不破月線，"
+                             f"出現第一根收盤高於前一日最高、量比 ≥ {TH['b_vr']} 的紅 K。")
+            if not unsuitable:
+                text += " 觸發當天收盤後再分析一次確認風報比。"
             trig = {"price": float(lvl), "vol": vneed, "text": text}
 
         # ---- 理由與風險 ----
@@ -831,5 +1003,6 @@ class Analyzer:
             "why": why, "trigger": trig, "pros": pros[:3], "cons": cons[:3], "conflicts": conflicts,
             "stats": stats, "enough": enough, "bt": bt, "recent_hits": recent,
             "decline": dec, "stale_days": stale_days, "etf": self.etf, "early": early,
-            "costs": (self.buy_c, self.sell_c),
+            "costs": (self.buy_c, self.sell_c), "funnel": getattr(self, "funnel", {}),
+            "atrp": float(self.ATRP[i]) if np.isfinite(self.ATRP[i]) else None, "candidates": cands,
         }
