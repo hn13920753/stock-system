@@ -52,10 +52,14 @@ TH = {
 }
 
 # 三項過濾的狀態（規則管理：正式採用／測試中／封存）
+# 2026-10-15 回測（research/filters.txt，全產業 1,387 筆）：
+#   ① 先到停利 32.9% → 40.1%、平均 −0.16% → −0.05%，前後兩段方向一致 → 預設開
+#   ② 只調整部位大小、不改勝率；空頭時訊號平均較差但後段樣本少 → 當風控用，預設開
+#   ③ 落後大盤的族群訊號反而沒有比較差（兩段皆然）→ 證據不支持，預設關（保留可開）
 FILTERS = {
-    "f_stop_atr": ("停損 ≥ 1 ATR", "測試中"),
-    "f_market": ("大盤濾網（空頭時股數減半）", "測試中"),
-    "f_sector": ("族群強弱（明顯弱於大盤時等待）", "測試中"),
+    "f_stop_atr": ("停損 ≥ 1 ATR", "測試中・回測支持"),
+    "f_market": ("大盤濾網（空頭時股數減半）", "測試中・風控用"),
+    "f_sector": ("族群強弱（明顯弱於大盤時等待）", "測試中・回測不支持，預設關"),
 }
 
 PATTERNS = {
@@ -77,7 +81,7 @@ DEFAULT_PARAMS = {
     "min_rr": 1.0,          # 最低風險報酬比
     "f_stop_atr": True,     # 過濾①：停損距離 < 1 ATR 不進場（測試中）
     "f_market": True,       # 過濾②：加權指數空頭時股數減半（測試中）
-    "f_sector": True,       # 過濾③：族群明顯弱於大盤時降為等待（測試中）
+    "f_sector": False,      # 過濾③：族群明顯弱於大盤時降為等待（測試中；回測不支持，預設關）
 }
 
 
@@ -298,6 +302,7 @@ def sector_index(closes: list) -> pd.Series | None:
     cs = [x for x in closes if x is not None and len(x) >= 60]
     if len(cs) < TH["rs_min_peers"]:
         return None
+    cs = [x[~x.index.duplicated(keep="last")].sort_index() for x in cs]
     ret = pd.concat([x.pct_change() for x in cs], axis=1)
     cnt = ret.notna().sum(axis=1)
     avg = ret.mean(axis=1).where(cnt >= TH["rs_min_peers"])
