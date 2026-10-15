@@ -15,7 +15,7 @@ import time
 import numpy as np
 import pandas as pd
 
-ENGINE_VERSION = "V1.2（量化門檻 V0.2・測試中）"
+ENGINE_VERSION = "V1.3（量化門檻 V0.3・測試中）"
 
 # ------------------------------------------------------------------
 # 量化門檻（測試中 V0.1）
@@ -44,6 +44,18 @@ TH = {
     "b_pull_max": 0.12,   # 策略B：回檔不超過 12%
     "b_touch": 0.015,     # 策略B：回檔低點需觸及 MA10/MA20 的 1.5% 以內
     "b_vr": 1.2,          # 策略B：觸發紅 K 量比 ≥ 1.2
+    # ---- V1.3 新增（三項過濾，測試中）----
+    "stop_atr_min": 1.0,  # 停損距離（進場價－停損）至少 1 × ATR14，太近容易被正常波動洗出
+    "rs_days": 20,        # 族群強弱：比較近 20 個交易日報酬
+    "rs_weak": -3.0,      # 族群 20 日報酬比大盤落後超過 3 個百分點 → 弱勢族群，降為等待
+    "rs_min_peers": 3,    # 族群指數至少要有 3 檔同業資料
+}
+
+# 三項過濾的狀態（規則管理：正式採用／測試中／封存）
+FILTERS = {
+    "f_stop_atr": ("停損 ≥ 1 ATR", "測試中"),
+    "f_market": ("大盤濾網（空頭時股數減半）", "測試中"),
+    "f_sector": ("族群強弱（明顯弱於大盤時等待）", "測試中"),
 }
 
 PATTERNS = {
@@ -63,6 +75,9 @@ DEFAULT_PARAMS = {
     "capital": 50000,       # 本次投入上限（元）
     "max_loss": 1500,       # 單筆最大可接受損失（元）
     "min_rr": 1.0,          # 最低風險報酬比
+    "f_stop_atr": True,     # 過濾①：停損距離 < 1 ATR 不進場（測試中）
+    "f_market": True,       # 過濾②：加權指數空頭時股數減半（測試中）
+    "f_sector": True,       # 過濾③：族群明顯弱於大盤時降為等待（測試中）
 }
 
 
@@ -212,35 +227,93 @@ def load_prices(code: str):
     return None, None, errors
 
 
-def market_env():
-    """台股加權指數環境（模組 01）。失敗回傳 None。"""
+def load_index(years: int = 5):
+    """加權指數日收盤（Series，索引為日期）。失敗回傳 None。"""
     try:
         import yfinance as yf
-        h = yf.Ticker("^TWII").history(period="1y", interval="1d", auto_adjust=False)
+        h = yf.Ticker("^TWII").history(period=f"{years}y", interval="1d", auto_adjust=False)
         if h is None or len(h) < 60:
             return None
-        c = h["Close"]
-        ma20, ma60 = c.rolling(20).mean(), c.rolling(60).mean()
-        last, m20, m60 = c.iloc[-1], ma20.iloc[-1], ma60.iloc[-1]
-        slope = ma20.iloc[-1] - ma20.iloc[-6]
-        if last > m20 and m20 > m60 and slope > 0:
-            state, score = "多頭", 1.0
-        elif last < m20 and m20 < m60:
-            state, score = "空頭", 0.0
-        else:
-            state, score = "盤整", 0.5
-        return {"state": state, "score": score, "close": float(last),
-                "ma20": float(m20), "ma60": float(m60),
-                "date": pd.Timestamp(h.index[-1]).strftime("%Y-%m-%d")}
+        c = h["Close"].astype(float)
+        c.index = pd.to_datetime(c.index).tz_localize(None).normalize()
+        return c[~c.index.duplicated(keep="last")].sort_index()
     except Exception:
         return None
+
+
+def market_states(c: pd.Series) -> pd.Series:
+    """每日大盤狀態分數：1 多頭（收盤 > MA20 > MA60 且 MA20 上彎）、0 空頭（收盤 < MA20 < MA60）、0.5 盤整。"""
+    ma20, ma60 = c.rolling(20).mean(), c.rolling(60).mean()
+    slope = ma20 - ma20.shift(5)
+    s = pd.Series(0.5, index=c.index)
+    s[(c > ma20) & (ma20 > ma60) & (slope > 0)] = 1.0
+    s[(c < ma20) & (ma20 < ma60)] = 0.0
+    s[ma60.isna()] = np.nan
+    return s
+
+
+def market_env(c: pd.Series | None = None):
+    """台股加權指數環境（模組 01）。失敗回傳 None。可傳入 load_index() 的結果避免重抓。"""
+    try:
+        if c is None:
+            c = load_index(1)
+        if c is None or len(c) < 60:
+            return None
+        ma20, ma60 = c.rolling(20).mean(), c.rolling(60).mean()
+        score = float(market_states(c).iloc[-1])
+        state = {1.0: "多頭", 0.0: "空頭"}.get(score, "盤整")
+        return {"state": state, "score": score, "close": float(c.iloc[-1]),
+                "ma20": float(ma20.iloc[-1]), "ma60": float(ma60.iloc[-1]),
+                "date": pd.Timestamp(c.index[-1]).strftime("%Y-%m-%d")}
+    except Exception:
+        return None
+
+
+def fetch_closes(stocks: list[dict], years: int = 5) -> dict:
+    """批次抓多檔收盤價（族群指數用）。stocks：[{"code","market"}]。回傳 {code: Series}，抓不到的略過。"""
+    out = {}
+    if not stocks:
+        return out
+    try:
+        import yfinance as yf
+        tick = {s["code"]: f"{s['code']}.{s.get('market', 'TW')}" for s in stocks}
+        data = yf.download(list(tick.values()), period=f"{years}y", interval="1d", group_by="ticker",
+                           auto_adjust=False, actions=False, threads=True, progress=False)
+        for code, tk in tick.items():
+            try:
+                sub = data[tk] if isinstance(data.columns, pd.MultiIndex) else data
+                c = sub["Close"].dropna().astype(float)
+                if len(c) >= 60:
+                    c.index = pd.to_datetime(c.index).tz_localize(None).normalize()
+                    out[code] = c
+            except Exception:  # noqa: BLE001
+                continue
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def sector_index(closes: list) -> pd.Series | None:
+    """族群指數：同業每日報酬等權平均後累乘（起點 100）。每天至少 rs_min_peers 檔有資料才計算。"""
+    cs = [x for x in closes if x is not None and len(x) >= 60]
+    if len(cs) < TH["rs_min_peers"]:
+        return None
+    ret = pd.concat([x.pct_change() for x in cs], axis=1)
+    cnt = ret.notna().sum(axis=1)
+    avg = ret.mean(axis=1).where(cnt >= TH["rs_min_peers"])
+    avg = avg.dropna()
+    if len(avg) < 60:
+        return None
+    return (1 + avg).cumprod() * 100
 
 
 # ------------------------------------------------------------------
 # 分析器
 # ------------------------------------------------------------------
 class Analyzer:
-    def __init__(self, df: pd.DataFrame, code: str, params: dict | None = None):
+    def __init__(self, df: pd.DataFrame, code: str, params: dict | None = None,
+                 mkt: pd.Series | None = None, sec: pd.Series | None = None, sec_name: str = ""):
+        """mkt：加權指數收盤序列；sec：族群指數序列（sector_index）。缺少時對應過濾顯示「無法判定」、不套用。"""
         if len(df) < 80:
             raise ValueError(f"歷史資料只有 {len(df)} 根，至少需要 80 根日 K。")
         self.df = df.copy()
@@ -249,6 +322,8 @@ class Analyzer:
         self.etf = is_etf(code)
         self.buy_c, self.sell_c = cost_rates(code, self.p)
         self._indicators()
+        self._context(mkt, sec)
+        self.sec_name = sec_name
         self._pivots()
         self.hits = [[] for _ in range(self.n)]
         for i in range(70, self.n):
@@ -315,6 +390,55 @@ class Analyzer:
         self.HH20P, self.LL20P = g("hh20p"), g("ll20p")
         self.ATR, self.ATRP = g("atr"), g("atrp")
         self.dates = [x.strftime("%Y-%m-%d") for x in d.index]
+
+    def _context(self, mkt, sec):
+        """把大盤與族群對齊到個股的交易日（只用當天以前的資料）。"""
+        idx = self.df.index
+        nd = TH["rs_days"]
+        self.MKT = np.full(self.n, np.nan)
+        self.MKT_RET = np.full(self.n, np.nan)
+        self.SEC_RET = np.full(self.n, np.nan)
+        if mkt is not None and len(mkt) >= 60:
+            u = mkt.index.union(idx)
+            self.MKT = market_states(mkt).reindex(u).ffill().reindex(idx).to_numpy(dtype=float)
+            mm = mkt.reindex(u).ffill().reindex(idx)  # 以個股交易日對齊後再算 20 日報酬
+            self.MKT_RET = ((mm / mm.shift(nd) - 1) * 100).to_numpy(dtype=float)
+        if sec is not None and len(sec) >= 60:
+            sv = sec.reindex(sec.index.union(idx)).ffill().reindex(idx)
+            self.SEC_RET = ((sv / sv.shift(nd) - 1) * 100).to_numpy(dtype=float)
+        self.SEC_RS = self.SEC_RET - self.MKT_RET  # 族群相對大盤（百分點）
+
+    def stop_atr(self, entry, stop, i):
+        a = self.ATR[i]
+        return (entry - stop) / a if np.isfinite(a) and a > 0 else float("nan")
+
+    def filter_notes(self, i, sig=None):
+        """三項過濾（測試中）的判斷結果。回傳 dict：block（擋下進場的原因）、halve（股數減半原因）、info（說明）。"""
+        out = {"block": [], "halve": [], "info": []}
+        if sig is not None:
+            k = self.stop_atr(sig["entry"], round_down(sig["stop"], self.etf), i)
+            if np.isfinite(k):
+                txt = f"停損距離 {k:.2f} 倍 ATR"
+                out["info"].append(txt)
+                if self.p.get("f_stop_atr") and k < TH["stop_atr_min"]:
+                    out["block"].append(f"{txt} < {TH['stop_atr_min']:g}（小於一天正常波動，容易被洗出）【測試中】")
+        ms = self.MKT[i]
+        if np.isfinite(ms):
+            if ms == 0.0:
+                out["info"].append("加權指數空頭")
+                if self.p.get("f_market"):
+                    out["halve"].append("加權指數空頭（收盤 < MA20 < MA60），股數減半【測試中】")
+        rs = self.SEC_RS[i]
+        if self.etf:
+            out["info"].append("族群強弱：ETF 不適用")
+        elif np.isfinite(rs):
+            name = self.sec_name or "族群"
+            out["info"].append(f"{name} 近 {TH['rs_days']} 日比大盤 {rs:+.1f} 個百分點")
+            if self.p.get("f_sector") and rs < TH["rs_weak"]:
+                out["block"].append(f"{name}近 {TH['rs_days']} 日落後大盤 {rs:.1f} 個百分點（弱勢族群）【測試中】")
+        else:
+            out["info"].append("族群強弱：無同業資料，無法判定")
+        return out
 
     def _pivots(self):
         n, H, L = TH["pivot"], self.H, self.L
@@ -695,14 +819,19 @@ class Analyzer:
             reasons.append(f"停損距離過大（淨虧 {pl['loss_pct']:.2f}%），風報比 {pl['rr']:.2f} < {self.p['min_rr']}")
         if pl["resistance"] and pl["resistance"] < pl["tp2"]:
             reasons.append(f"上方壓力 {pl['resistance']:g} 低於 2% 停利價 {pl['tp2']:g}，獲利空間不足")
+        reasons += self.filter_notes(i, {**sig, "entry": entry})["block"]
         return (not reasons), reasons, pl
 
     # ---------------- 回測 ----------------
     FUNNEL_ORDER = ["出現訊號", "否決（跌停／破底／衰退）", "股性不符", "風報比不足", "上方壓力太近",
-                    "開高不追", "漲停買不到", "開低破停損", "限價未成交", "成交"]
+                    "停損太近（<1 ATR）", "族群弱勢", "開高不追", "漲停買不到", "開低破停損", "限價未成交", "成交"]
 
     @staticmethod
     def _reason_key(r):
+        if "ATR】" in r or "倍 ATR" in r:
+            return "停損太近（<1 ATR）"
+        if "弱勢族群" in r:
+            return "族群弱勢"
         if "股性" in r:
             return "股性不符"
         if "風報比" in r:
@@ -801,6 +930,13 @@ class Analyzer:
                 i += 1
                 continue
             funnel["成交"] += 1
+            # 研究用標記（訊號當天的狀態，不影響結果）
+            k = self.stop_atr(c["entry"], round_down(c["stop"], self.etf), i)
+            t["停損/ATR"] = round(k, 2) if np.isfinite(k) else None
+            ms = self.MKT[i]
+            t["大盤"] = {1.0: "多頭", 0.0: "空頭", 0.5: "盤整"}.get(ms, "無資料") if np.isfinite(ms) else "無資料"
+            rs = self.SEC_RS[i]
+            t["族群RS"] = round(float(rs), 2) if np.isfinite(rs) else None
             trades.append(t)
             i = xj + 1
         self.funnel = funnel
@@ -859,11 +995,14 @@ class Analyzer:
         def mod(no, name, score, text):
             mods.append({"no": no, "name": name, "score": score, "text": text})
 
+        fnote = self.filter_notes(i, sig)
+        rs_txt = next((x for x in fnote["info"] if "族群" in x or "大盤 " in x), "")
         if market:
             mod("01", "市場環境", market["score"],
-                f"加權指數 {market['state']}（{market['close']:,.0f}，MA20 {market['ma20']:,.0f}／MA60 {market['ma60']:,.0f}，{market['date']}）")
+                f"加權指數 {market['state']}（{market['close']:,.0f}，MA20 {market['ma20']:,.0f}／MA60 {market['ma60']:,.0f}，{market['date']}）"
+                + (f"；{rs_txt}" if rs_txt else "") + "；法人資料未納入")
         else:
-            mod("01", "市場環境", None, "無法取得加權指數，無法判定；產業與法人資料未納入")
+            mod("01", "市場環境", None, "無法取得加權指數，無法判定" + (f"；{rs_txt}" if rs_txt else ""))
         mod("02", "趨勢結構", st["score"],
             st["state"] + (f"；前高 {st['last_high']:g}、前低 {st['last_low']:g}" if st["last_high"] else ""))
         if self.hits[i] or any(("回測" in c["type"] or "拉回" in c["type"]) for c in cands):
@@ -921,10 +1060,16 @@ class Analyzer:
             ok = False
             why.append("本股過去同類訊號平均報酬為負")
         early = False
+        halve = []
         if ok and st["score"] == 0.0 and pl:
             early = True  # 空頭結構中的空轉多突破：積極型買點，部位減半
-            for key in ("shares",):
-                pl[key] = pl[key] // 2
+            halve.append("早期空轉多買點")
+        if ok and pl and fnote["halve"]:
+            halve += fnote["halve"]
+        if halve and pl:
+            pl = dict(pl)
+            pl["shares"] = pl["shares"] // (2 ** len(halve))  # 每一項減半條件各減半一次
+            pl["halve"] = halve
             per = pl["entry"] * (1 + self.buy_c)
             pl["cost"] = pl["shares"] * per
             pl["max_loss"] = pl["shares"] * (per - pl["stop"] * (1 - self.sell_c))
@@ -966,6 +1111,10 @@ class Analyzer:
                     text += (f" 多頭回檔買點（策略B）：拉回 MA10 {self.MA10[i]:.2f}～MA20 {self.MA20[i]:.2f} 一帶不破月線，"
                              f"出現第一根收盤高於前一日最高、量比 ≥ {TH['b_vr']} 的紅 K。")
             if not unsuitable:
+                if any("ATR" in b for b in fnote["block"]):
+                    text += f" 目前訊號的停損離進場價太近（< {TH['stop_atr_min']:g} ATR），等更遠、更明確的結構停損再進場。"
+                if any("弱勢族群" in b for b in fnote["block"]):
+                    text += f" 族群目前明顯弱於大盤，等族群 {TH['rs_days']} 日表現追上大盤（落後不超過 {abs(TH['rs_weak']):g} 個百分點）再考慮。"
                 text += " 觸發當天收盤後再分析一次確認風報比。"
             trig = {"price": float(lvl), "vol": vneed, "text": text}
 
@@ -989,6 +1138,10 @@ class Analyzer:
             conflicts.append("帶量長紅 vs 位在高檔 → 留意高檔出貨換手")
         if early:
             conflicts.append("型態突破 vs 仍是空頭結構 → 屬早期空轉多（積極型）買點，部位已自動減半")
+        if ok and fnote["halve"]:
+            conflicts.append("個股訊號成立 vs 大盤空頭 → 可進場但股數減半（大盤濾網・測試中）")
+        if not ok and fnote["block"]:
+            cons.insert(0, "過濾（測試中）：" + "；".join(fnote["block"]))
         if 10 <= stats["n"] < 30 and stats["avg"] < 0:
             cons.insert(0, f"本股過去 {stats['n']} 筆同類訊號平均 {stats['avg']:+.2f}%（為負，樣本雖少仍需警惕）")
         if pl and pl["resistance"] and pl["resistance"] < pl["tp3"]:
@@ -1005,4 +1158,5 @@ class Analyzer:
             "decline": dec, "stale_days": stale_days, "etf": self.etf, "early": early,
             "costs": (self.buy_c, self.sell_c), "funnel": getattr(self, "funnel", {}),
             "atrp": float(self.ATRP[i]) if np.isfinite(self.ATRP[i]) else None, "candidates": cands,
+            "filters": fnote, "filter_flags": {k: bool(self.p.get(k)) for k in FILTERS},
         }
