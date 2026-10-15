@@ -1,7 +1,7 @@
-# 股票系統 App｜完整規格書（V1.2）
+# 股票系統 App｜完整規格書（V1.3）
 
 > 用途：在新對話中，以本 App 的架構為基礎設計其他 App。
-> 整理日期：2026-10-12　作者：hn13920753 × Claude
+> 整理日期：2026-10-15（V1.3 三項過濾）　作者：hn13920753 × Claude
 > 線上網址：https://stock-system-lqsagprjrcinwhfmmqyzmn.streamlit.app
 > 程式倉庫：https://github.com/hn13920753/stock-system（Public，分支 main）
 
