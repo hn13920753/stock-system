@@ -15,6 +15,7 @@ import time
 import numpy as np
 import pandas as pd
 
+DATA_YEARS = 10  # 歷史日K抓取年數（回測用；2026-10-16 由 5 年延長為 10 年）
 ENGINE_VERSION = "V1.3（量化門檻 V0.3・測試中）"
 
 # ------------------------------------------------------------------
@@ -138,7 +139,7 @@ def _clean(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def fetch_yahoo(code: str, years: int = 5):
+def fetch_yahoo(code: str, years: int = DATA_YEARS):
     import yfinance as yf
 
     for suf in (".TW", ".TWO"):
@@ -231,7 +232,7 @@ def load_prices(code: str):
     return None, None, errors
 
 
-def load_index(years: int = 5):
+def load_index(years: int = DATA_YEARS):
     """加權指數日收盤（Series，索引為日期）。失敗回傳 None。"""
     try:
         import yfinance as yf
@@ -273,7 +274,7 @@ def market_env(c: pd.Series | None = None):
         return None
 
 
-def fetch_closes(stocks: list[dict], years: int = 5) -> dict:
+def fetch_closes(stocks: list[dict], years: int = DATA_YEARS) -> dict:
     """批次抓多檔收盤價（族群指數用）。stocks：[{"code","market"}]。回傳 {code: Series}，抓不到的略過。"""
     out = {}
     if not stocks:
