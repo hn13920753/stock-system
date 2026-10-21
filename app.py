@@ -194,10 +194,12 @@ with st.form("q"):
         hold = c2.selectbox("最長持有（交易日）", [15, 10, 5])
         discount = c1.number_input("手續費折扣（6 折填 0.6）", 0.1, 1.0, 1.0, 0.05)
         min_rr = c2.number_input("最低風險報酬比", 0.5, 3.0, 1.0, 0.1)
-        st.markdown("**三項過濾（測試中）**")
+        st.markdown("**過濾與積極組（測試中）**")
         f1 = st.checkbox("停損距離至少 1 倍 ATR（太近不進場）", value=E.DEFAULT_PARAMS["f_stop_atr"])
         f2 = st.checkbox("大盤空頭時股數減半", value=E.DEFAULT_PARAMS["f_market"])
         f3 = st.checkbox("族群明顯弱於大盤時等待", value=E.DEFAULT_PARAMS["f_sector"])
+        f4 = st.checkbox("積極組：高波動個股改用小部位、寬停損、5% 停利（測試中）", value=E.DEFAULT_PARAMS["f_aggr"])
+        aggr_loss = st.number_input("積極組單筆最大損失（元）", 1000, 1_000_000, E.DEFAULT_PARAMS["aggr_max_loss"], 1000)
         csv = st.file_uploader("自動抓不到資料時，可上傳 CSV（Date,Open,High,Low,Close,Volume；量單位：張）",
                                type=["csv"])
     go = st.form_submit_button("分析", type="primary", use_container_width=True)
@@ -213,7 +215,8 @@ if not re.fullmatch(r"\d{4,6}[A-Z]?", code):
     st.stop()
 
 params = {"capital": capital, "max_loss": max_loss, "target_net": target, "hold_days": hold,
-          "fee_discount": discount, "min_rr": min_rr, "f_stop_atr": f1, "f_market": f2, "f_sector": f3}
+          "fee_discount": discount, "min_rr": min_rr, "f_stop_atr": f1, "f_market": f2, "f_sector": f3,
+          "f_aggr": f4, "aggr_max_loss": aggr_loss}
 
 with st.spinner("抓取歷史股價與計算中…"):
     if csv is not None:

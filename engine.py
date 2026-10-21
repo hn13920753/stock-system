@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 
 DATA_YEARS = 10  # 歷史日K抓取年數（回測用；2026-10-16 由 5 年延長為 10 年）
-ENGINE_VERSION = "V1.3（量化門檻 V0.3・測試中）"
+ENGINE_VERSION = "V1.4（量化門檻 V0.4・測試中）"
 
 # ------------------------------------------------------------------
 # 量化門檻（測試中 V0.1）
@@ -50,6 +50,8 @@ TH = {
     "rs_days": 20,        # 族群強弱：比較近 20 個交易日報酬
     "rs_weak": -3.0,      # 族群 20 日報酬比大盤落後超過 3 個百分點 → 弱勢族群，降為等待
     "rs_min_peers": 3,    # 族群指數至少要有 3 檔同業資料
+    # ---- V1.4 新增（積極組，測試中）----
+    "aggr_atr_max": 9.0,  # 積極組：ATR14 占股價 4.5%～9% 的個股（超過 9% 仍不適合）
 }
 
 # 三項過濾的狀態（規則管理：正式採用／測試中／封存）
@@ -61,6 +63,7 @@ FILTERS = {
     "f_stop_atr": ("停損 ≥ 1 ATR", "測試中・回測支持"),
     "f_market": ("大盤濾網（空頭時股數減半）", "測試中・風控用"),
     "f_sector": ("族群強弱（明顯弱於大盤時等待）", "測試中・回測不支持，預設關"),
+    "f_aggr": ("積極組（高波動個股：小部位、寬停損、5% 停利）", "測試中・紙上交易驗證中"),
 }
 
 PATTERNS = {
@@ -83,6 +86,13 @@ DEFAULT_PARAMS = {
     "f_stop_atr": True,     # 過濾①：停損距離 < 1 ATR 不進場（測試中）
     "f_market": True,       # 過濾②：加權指數空頭時股數減半（測試中）
     "f_sector": False,      # 過濾③：族群明顯弱於大盤時降為等待（測試中；回測不支持，預設關）
+    # ---- V1.4 積極組（測試中）：原本「股性波動過大」的個股改用小部位操作 ----
+    "f_aggr": False,        # 積極組開關
+    "aggr_target": 5.0,     # 積極組淨獲利目標 %
+    "aggr_stop_atr": 1.5,   # 積極組停損：至少離進場價 1.5 × ATR14（與結構停損取較低者）
+    "aggr_min_rr": 0.5,     # 積極組最低風險報酬比（寬停損下 1.0 幾乎不可能達到）
+    "aggr_max_loss": 20000, # 積極組單筆最大損失（元）＝總資金 100 萬的 2%
+    "aggr_capital": 300000, # 積極組單筆投入上限（元）
 }
 
 
@@ -417,6 +427,16 @@ class Analyzer:
     def stop_atr(self, entry, stop, i):
         a = self.ATR[i]
         return (entry - stop) / a if np.isfinite(a) and a > 0 else float("nan")
+
+    def aggressive(self, i):
+        """積極組：開關打開、是個股、ATR% 介於 atr_max 與 aggr_atr_max 之間。"""
+        ap = self.ATRP[i]
+        return bool(self.p.get("f_aggr")) and not self.etf and np.isfinite(ap) \
+            and TH["atr_max"] < ap <= TH["aggr_atr_max"]
+
+    def tgt(self, i):
+        """第 i 天訊號使用的淨利目標 %。"""
+        return float(self.p["aggr_target"] if self.aggressive(i) else self.p["target_net"])
 
     def filter_notes(self, i, sig=None):
         """三項過濾（測試中）的判斷結果。回傳 dict：block（擋下進場的原因）、halve（股數減半原因）、info（說明）。"""
@@ -768,6 +788,10 @@ class Analyzer:
             out.append({**bj, "type": "多頭回檔掛單（策略B）", "mode": "limit", "entry": float(limit),
                         "src": self.dates[j], "days_left": TH["limit_valid"] - (i - j)})
             break
+        if self.aggressive(i):  # 積極組：停損放寬到至少 aggr_stop_atr 倍 ATR
+            k = float(self.p["aggr_stop_atr"])
+            out = [{**c, "stop": float(min(c["stop"], c["entry"] - k * self.ATR[i])), "aggr": True,
+                    "note": (c.get("note", "") + f"；積極組停損 ≥ {k:g} ATR").lstrip("；")} for c in out]
         return [c for c in out if c["stop"] < c["entry"]]
 
     def signal(self, i):
@@ -779,7 +803,7 @@ class Analyzer:
         ap = self.ATRP[i]
         if not np.isfinite(ap):
             return None
-        if ap > TH["atr_max"]:
+        if ap > TH["atr_max"] and not self.aggressive(i):
             return f"股性波動過大（日均波動 ATR {ap:.1f}% > {TH['atr_max']}%），停損距離難以配合 {self.p['target_net']:g}% 目標"
         if ap < TH["atr_min"]:
             return f"股性波動過小（ATR {ap:.1f}% < {TH['atr_min']}%），{self.p['hold_days']} 日內不易達 {self.p['target_net']:g}%"
@@ -797,21 +821,25 @@ class Analyzer:
         return v
 
     def plan(self, i, entry, stop):
-        tp3 = target_price(entry, self.p["target_net"], self.buy_c, self.sell_c, self.etf)
-        tp2 = target_price(entry, 2.0, self.buy_c, self.sell_c, self.etf)
+        ag = self.aggressive(i)
+        tgt = self.tgt(i)
+        tp3 = target_price(entry, tgt, self.buy_c, self.sell_c, self.etf)  # 主要停利（積極組為 5%）
+        tp2 = target_price(entry, 3.0 if ag else 2.0, self.buy_c, self.sell_c, self.etf)  # 遇壓力的提早停利
         stop = round_down(stop, self.etf)
         loss_pct = net_return(entry, stop, self.buy_c, self.sell_c)
-        rr = self.p["target_net"] / abs(loss_pct) if loss_pct < 0 else float("inf")
+        rr = tgt / abs(loss_pct) if loss_pct < 0 else float("inf")
         per_share_cost = entry * (1 + self.buy_c)
         per_share_loss = per_share_cost - stop * (1 - self.sell_c)
-        shares = int(min(self.p["capital"] // per_share_cost,
-                         self.p["max_loss"] // per_share_loss if per_share_loss > 0 else 1e12))
+        cap = self.p["aggr_capital"] if ag else self.p["capital"]
+        mloss = self.p["aggr_max_loss"] if ag else self.p["max_loss"]
+        shares = int(min(cap // per_share_cost,
+                         mloss // per_share_loss if per_share_loss > 0 else 1e12))
         res = self.resistance_above(i, entry)
         return {"entry": entry, "tp3": tp3, "tp2": tp2, "stop": stop, "loss_pct": loss_pct,
                 "rr": rr, "shares": max(shares, 0), "cost": shares * per_share_cost,
                 "max_loss": shares * per_share_loss,
                 "profit": shares * (tp3 * (1 - self.sell_c) - per_share_cost),
-                "resistance": res}
+                "resistance": res, "aggr": ag, "target": tgt, "tp2_pct": 3.0 if ag else 2.0}
 
     def tradable(self, i, sig, entry=None):
         """風控檢查：否決條件、股性、風報比、上方壓力。回傳 (可否, 原因列表, 計畫)。"""
@@ -821,10 +849,11 @@ class Analyzer:
         if su:
             reasons.append(su)
         pl = self.plan(i, entry, sig["stop"])
-        if pl["rr"] < self.p["min_rr"]:
-            reasons.append(f"停損距離過大（淨虧 {pl['loss_pct']:.2f}%），風報比 {pl['rr']:.2f} < {self.p['min_rr']}")
+        min_rr = self.p["aggr_min_rr"] if pl["aggr"] else self.p["min_rr"]
+        if pl["rr"] < min_rr:
+            reasons.append(f"停損距離過大（淨虧 {pl['loss_pct']:.2f}%），風報比 {pl['rr']:.2f} < {min_rr}")
         if pl["resistance"] and pl["resistance"] < pl["tp2"]:
-            reasons.append(f"上方壓力 {pl['resistance']:g} 低於 2% 停利價 {pl['tp2']:g}，獲利空間不足")
+            reasons.append(f"上方壓力 {pl['resistance']:g} 低於 {pl['tp2_pct']:g}% 停利價 {pl['tp2']:g}，獲利空間不足")
         reasons += self.filter_notes(i, {**sig, "entry": entry})["block"]
         return (not reasons), reasons, pl
 
@@ -875,7 +904,7 @@ class Analyzer:
                     break
             if start is None:
                 return (None, None, "限價未成交") if i + TH["limit_valid"] < n else (None, None, None)
-        tp = target_price(entry, self.p["target_net"], self.buy_c, self.sell_c, self.etf)
+        tp = target_price(entry, self.tgt(i), self.buy_c, self.sell_c, self.etf)
         last = start + hold - 1
         if last >= n:
             return None, None, None
@@ -904,6 +933,7 @@ class Analyzer:
             "結果": why, "淨報酬%": round(net_return(entry, exit_, self.buy_c, self.sell_c), 2),
             "持有天數": xj - start + 1, "最大不利%": round(mae * 100, 2), "最大有利%": round(mfe * 100, 2),
             "買點": c["type"].split("（")[0], "型態": tag,
+            "積極組": bool(c.get("aggr")), "ATR%": round(float(self.ATRP[i]), 2) if np.isfinite(self.ATRP[i]) else None,
         }, xj, None
 
     def backtest(self):
@@ -1082,7 +1112,10 @@ class Analyzer:
             pl["profit"] = pl["shares"] * (pl["tp3"] * (1 - self.sell_c) - per)
         unsuitable = self.suitability(i)
         if ok:
-            decision, color = ("可進場（掛單）" if sig["mode"] == "limit" else "可進場"), "green"
+            tag = "積極組" if pl and pl.get("aggr") else ""
+            mode = "掛單" if sig["mode"] == "limit" else ""
+            inner = "・".join(x for x in (tag, mode) if x)
+            decision, color = (f"可進場（{inner}）" if inner else "可進場"), "green"
         elif self.vetoes(i):
             decision, color = "不可進場", "red"
         elif unsuitable:
@@ -1103,6 +1136,10 @@ class Analyzer:
                 text = (f"這檔股票日均波動約 {self.ATRP[i]:.1f}%，與「{self.p['hold_days']} 日內淨賺 "
                         f"{self.p['target_net']:g}%」的策略不匹配，系統不提供買點。"
                         f"本策略適合日均波動 {TH['atr_min']}%～{TH['atr_max']}% 的股票。")
+                ap = self.ATRP[i]
+                if not self.etf and np.isfinite(ap) and TH["atr_max"] < ap <= TH["aggr_atr_max"] and not self.p.get("f_aggr"):
+                    text += ("（可在進階設定開啟「積極組・測試中」：小部位、停損放寬到 "
+                             f"{self.p['aggr_stop_atr']:g} ATR、淨利 {self.p['aggr_target']:g}% 出場。）")
             elif self.vetoes(i) and not (sig and ok):
                 text = ("① 先等止跌：某天不跌停、不創新低，且收在當日區間上半部（止跌 K）。"
                         f"② 積極買點：之後收盤突破止跌 K 最高價、收紅、量 ≥ {vneed:,.0f} 張；停損 = 止跌 K 最低價。")
@@ -1144,6 +1181,9 @@ class Analyzer:
             conflicts.append("帶量長紅 vs 位在高檔 → 留意高檔出貨換手")
         if early:
             conflicts.append("型態突破 vs 仍是空頭結構 → 屬早期空轉多（積極型）買點，部位已自動減半")
+        if pl and pl.get("aggr"):
+            conflicts.append(f"高波動個股（ATR {self.ATRP[i]:.1f}%）→ 積極組：停損放寬、淨利 {pl['target']:g}% 出場、"
+                             f"單筆最大損失 {self.p['aggr_max_loss']:,.0f} 元以內（測試中，尚未證實有優勢）")
         if ok and fnote["halve"]:
             conflicts.append("個股訊號成立 vs 大盤空頭 → 可進場但股數減半（大盤濾網・測試中）")
         if not ok and fnote["block"]:
@@ -1151,7 +1191,7 @@ class Analyzer:
         if 10 <= stats["n"] < 30 and stats["avg"] < 0:
             cons.insert(0, f"本股過去 {stats['n']} 筆同類訊號平均 {stats['avg']:+.2f}%（為負，樣本雖少仍需警惕）")
         if pl and pl["resistance"] and pl["resistance"] < pl["tp3"]:
-            conflicts.append(f"3% 停利價 {pl['tp3']:g} 高於前方壓力 {pl['resistance']:g} → 可改用 2% 停利 {pl['tp2']:g}")
+            conflicts.append(f"{pl['target']:g}% 停利價 {pl['tp3']:g} 高於前方壓力 {pl['resistance']:g} → 可改用 {pl['tp2_pct']:g}% 停利 {pl['tp2']:g}")
 
         last_date = self.df.index[-1]
         stale_days = (pd.Timestamp(dt.date.today()) - last_date).days

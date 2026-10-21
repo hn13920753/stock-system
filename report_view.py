@@ -80,7 +80,7 @@ def render_report(r, an, df, src, target, hold, title=None):
              if r["signal"].get("mode") == "limit" else
              ("買進價", f"約 {price(pl['entry'])}（明日開盤高於 {price(E.round_up(pl['entry'] * 1.01, r['etf']))} 就不追）")),
             ("買進數量", f"{qty}（約 {money(pl['cost'])} 元）{half}"),
-            ("停利", f"{price(pl['tp3'])}（淨 +{target:g}% 全出）；遇壓力可改 {price(pl['tp2'])}（淨 +2%）"),
+            ("停利", f"{price(pl['tp3'])}（淨 +{pl.get('target', target):g}% 全出）；遇壓力可改 {price(pl['tp2'])}（淨 +{pl.get('tp2_pct', 2.0):g}%）"),
             ("停損", f"{price(pl['stop'])}（碰到即出，建議設觸價停損單；淨 {pl['loss_pct']:.2f}%）"),
             ("最大損失", f"約 {money(pl['max_loss'])} 元"),
             ("風險報酬比", f"{pl['rr']:.2f}"),
@@ -88,6 +88,9 @@ def render_report(r, an, df, src, target, hold, title=None):
             ("最晚出場", f"第 {hold} 個交易日收盤"),
             ("撤退條件", "跌破停損、爆量長黑、跌回突破價之下（假突破）"),
         ]
+        if pl.get("aggr"):
+            st.info(f"⚡ 積極組（測試中）：高波動個股，停損放寬、淨利 {pl.get('target', 5):g}% 出場，"
+                    "股數依「單筆最大損失」反推。尚未證實有優勢，正在紙上交易驗證。")
         st.table(pd.DataFrame(rows, columns=["項目", "內容"]).set_index("項目"))
         if pl["shares"] == 0:
             st.warning("依目前資金與最大損失設定，買不到 1 股，請調整進階設定。")
