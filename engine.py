@@ -63,7 +63,7 @@ FILTERS = {
     "f_stop_atr": ("停損 ≥ 1 ATR", "測試中・回測支持"),
     "f_market": ("大盤濾網（空頭時股數減半）", "測試中・風控用"),
     "f_sector": ("族群強弱（明顯弱於大盤時等待）", "測試中・回測不支持，預設關"),
-    "f_aggr": ("積極組（高波動個股：小部位、寬停損、5% 停利）", "測試中・紙上交易驗證中"),
+    "f_aggr": ("積極組（高波動個股：寬停損 2 ATR、淨利 8% 出場、固定最大損失）", "測試中・回測支持・紙上交易驗證中，預設關"),
 }
 
 PATTERNS = {
@@ -86,11 +86,15 @@ DEFAULT_PARAMS = {
     "f_stop_atr": True,     # 過濾①：停損距離 < 1 ATR 不進場（測試中）
     "f_market": True,       # 過濾②：加權指數空頭時股數減半（測試中）
     "f_sector": False,      # 過濾③：族群明顯弱於大盤時降為等待（測試中；回測不支持，預設關）
-    # ---- V1.4 積極組（測試中）：原本「股性波動過大」的個股改用小部位操作 ----
+    # ---- V1.4 積極組（測試中）：原本「股性波動過大」的個股改用固定最大損失反推股數 ----
+    # 2026-10-21 回測（research/aggr.txt，高波動個股 797 筆）：只有「8%・停損 2 ATR」前後兩段都賺
+    #   （扣滑價 前段 +0.56%、後段 +1.08%）；5%・1.5 ATR 前段 −0.41%、5%・2 ATR 前段 −0.30% → 不採用。
+    #   使用者要求先紙上交易兩週 → App 預設關，records/paper_aggr.csv 每日自動記錄。
     "f_aggr": False,        # 積極組開關
-    "aggr_target": 5.0,     # 積極組淨獲利目標 %
-    "aggr_stop_atr": 1.5,   # 積極組停損：至少離進場價 1.5 × ATR14（與結構停損取較低者）
-    "aggr_min_rr": 0.5,     # 積極組最低風險報酬比（寬停損下 1.0 幾乎不可能達到）
+    "aggr_target": 8.0,     # 積極組淨獲利目標 %
+    "aggr_early": 3.0,      # 積極組：上方壓力低於此停利價就不進場；遇壓力可提早在此出場 %（與回測一致）
+    "aggr_stop_atr": 2.0,   # 積極組停損：至少離進場價 2 × ATR14（與結構停損取較低者）
+    "aggr_min_rr": 0.3,     # 積極組最低風險報酬比（寬停損下 1.0 幾乎不可能達到）
     "aggr_max_loss": 20000, # 積極組單筆最大損失（元）＝總資金 100 萬的 2%
     "aggr_capital": 300000, # 積極組單筆投入上限（元）
 }
@@ -824,7 +828,8 @@ class Analyzer:
         ag = self.aggressive(i)
         tgt = self.tgt(i)
         tp3 = target_price(entry, tgt, self.buy_c, self.sell_c, self.etf)  # 主要停利（積極組為 5%）
-        tp2 = target_price(entry, 3.0 if ag else 2.0, self.buy_c, self.sell_c, self.etf)  # 遇壓力的提早停利
+        early = float(self.p["aggr_early"]) if ag else 2.0
+        tp2 = target_price(entry, early, self.buy_c, self.sell_c, self.etf)  # 遇壓力的提早停利
         stop = round_down(stop, self.etf)
         loss_pct = net_return(entry, stop, self.buy_c, self.sell_c)
         rr = tgt / abs(loss_pct) if loss_pct < 0 else float("inf")
@@ -839,7 +844,7 @@ class Analyzer:
                 "rr": rr, "shares": max(shares, 0), "cost": shares * per_share_cost,
                 "max_loss": shares * per_share_loss,
                 "profit": shares * (tp3 * (1 - self.sell_c) - per_share_cost),
-                "resistance": res, "aggr": ag, "target": tgt, "tp2_pct": 3.0 if ag else 2.0}
+                "resistance": res, "aggr": ag, "target": tgt, "tp2_pct": early}
 
     def tradable(self, i, sig, entry=None):
         """風控檢查：否決條件、股性、風報比、上方壓力。回傳 (可否, 原因列表, 計畫)。"""
@@ -1138,7 +1143,7 @@ class Analyzer:
                         f"本策略適合日均波動 {TH['atr_min']}%～{TH['atr_max']}% 的股票。")
                 ap = self.ATRP[i]
                 if not self.etf and np.isfinite(ap) and TH["atr_max"] < ap <= TH["aggr_atr_max"] and not self.p.get("f_aggr"):
-                    text += ("（可在進階設定開啟「積極組・測試中」：小部位、停損放寬到 "
+                    text += ("（可在進階設定開啟「積極組・測試中」：停損放寬到 "
                              f"{self.p['aggr_stop_atr']:g} ATR、淨利 {self.p['aggr_target']:g}% 出場。）")
             elif self.vetoes(i) and not (sig and ok):
                 text = ("① 先等止跌：某天不跌停、不創新低，且收在當日區間上半部（止跌 K）。"

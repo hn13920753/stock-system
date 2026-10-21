@@ -89,7 +89,7 @@ def render_report(r, an, df, src, target, hold, title=None):
             ("撤退條件", "跌破停損、爆量長黑、跌回突破價之下（假突破）"),
         ]
         if pl.get("aggr"):
-            st.info(f"⚡ 積極組（測試中）：高波動個股，停損放寬、淨利 {pl.get('target', 5):g}% 出場，"
+            st.info(f"⚡ 積極組（測試中）：高波動個股，停損放寬到 2 ATR、淨利 {pl.get('target', 8):g}% 出場，"
                     "股數依「單筆最大損失」反推。尚未證實有優勢，正在紙上交易驗證。")
         st.table(pd.DataFrame(rows, columns=["項目", "內容"]).set_index("項目"))
         if pl["shares"] == 0:
