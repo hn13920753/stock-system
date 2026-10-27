@@ -182,7 +182,7 @@ def price(x):
 
 # ------------------------------------------------------------------
 st.markdown("### 📈 股票系統｜短線決策")
-st.caption("5～15 交易日・淨利 2～3%・風控優先")
+st.caption("短線買點＋回檔布局（測試中）・風控優先")
 
 with st.form("q"):
     code = st.text_input("股票代碼", placeholder="例如 2059、2330、00981A", max_chars=7)
@@ -190,8 +190,11 @@ with st.form("q"):
         c1, c2 = st.columns(2)
         capital = c1.number_input("本次投入上限（元）", 1000, 10_000_000, 50_000, 1000)
         max_loss = c2.number_input("單筆最大損失（元）", 100, 1_000_000, 1_500, 100)
-        target = c1.selectbox("淨獲利目標", [3.0, 2.0], format_func=lambda x: f"{x:g}%")
-        hold = c2.selectbox("最長持有（交易日）", [15, 10, 5])
+        _t = [10.0, 5.0, 3.0, 2.0]
+        _h = [60, 30, 15, 10, 5]
+        target = c1.selectbox("淨獲利目標（短線買點）", _t, index=_t.index(E.DEFAULT_PARAMS["target_net"]),
+                              format_func=lambda x: f"{x:g}%")
+        hold = c2.selectbox("最長持有（交易日）", _h, index=_h.index(E.DEFAULT_PARAMS["hold_days"]))
         discount = c1.number_input("手續費折扣（6 折填 0.6）", 0.1, 1.0, 1.0, 0.05)
         min_rr = c2.number_input("最低風險報酬比", 0.5, 3.0, 1.0, 0.1)
         st.markdown("**過濾與積極組（測試中）**")
@@ -200,6 +203,13 @@ with st.form("q"):
         f3 = st.checkbox("族群明顯弱於大盤時等待", value=E.DEFAULT_PARAMS["f_sector"])
         f4 = st.checkbox("積極組：高波動個股改用寬停損 2 ATR、淨利 8% 出場、固定最大損失（測試中・紙上交易驗證中）", value=E.DEFAULT_PARAMS["f_aggr"])
         aggr_loss = st.number_input("積極組單筆最大損失（元）", 1000, 1_000_000, E.DEFAULT_PARAMS["aggr_max_loss"], 1000)
+        st.markdown("**回檔布局（測試中）**")
+        f5 = st.checkbox("回檔布局：離 60 日高點跌到門檻就買、淨賺 10% 賣、−20% 停損、最多 60 天（高波動股也適用）",
+                         value=E.DEFAULT_PARAMS["f_dip"])
+        c3, c4 = st.columns(2)
+        dip_s = c3.number_input("個股跌幅門檻（%）", 10.0, 60.0, E.DEFAULT_PARAMS["dip_drop_stock"], 5.0)
+        dip_e = c4.number_input("ETF 跌幅門檻（%）", 5.0, 60.0, E.DEFAULT_PARAMS["dip_drop_etf"], 5.0)
+        dip_cap = c3.number_input("回檔布局每筆金額（元）", 10_000, 5_000_000, E.DEFAULT_PARAMS["dip_capital"], 10_000)
         csv = st.file_uploader("自動抓不到資料時，可上傳 CSV（Date,Open,High,Low,Close,Volume；量單位：張）",
                                type=["csv"])
     go = st.form_submit_button("分析", type="primary", use_container_width=True)
@@ -216,7 +226,8 @@ if not re.fullmatch(r"\d{4,6}[A-Z]?", code):
 
 params = {"capital": capital, "max_loss": max_loss, "target_net": target, "hold_days": hold,
           "fee_discount": discount, "min_rr": min_rr, "f_stop_atr": f1, "f_market": f2, "f_sector": f3,
-          "f_aggr": f4, "aggr_max_loss": aggr_loss}
+          "f_aggr": f4, "aggr_max_loss": aggr_loss, "f_dip": f5, "dip_drop_stock": dip_s,
+          "dip_drop_etf": dip_e, "dip_capital": dip_cap}
 
 with st.spinner("抓取歷史股價與計算中…"):
     if csv is not None:

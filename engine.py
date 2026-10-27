@@ -1,7 +1,7 @@
 """
 股票系統｜分析引擎
 ------------------------------------------------------------
-小朱老師 AI 工作系統：短線 5～15 交易日、淨利 2～3%、風控優先。
+小朱老師 AI 工作系統：短線買點（V1.5 起淨利 10%、最多 60 天）＋回檔布局（測試中）、風控優先。
 
 本檔只做計算，不含畫面。所有門檻集中在 TH，屬「測試中 V0.1」，
 之後依回測與實際交易結果修正。
@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 
 DATA_YEARS = 10  # 歷史日K抓取年數（回測用；2026-10-16 由 5 年延長為 10 年）
-ENGINE_VERSION = "V1.4（量化門檻 V0.4・測試中）"
+ENGINE_VERSION = "V1.5（量化門檻 V0.5・測試中）"
 
 # ------------------------------------------------------------------
 # 量化門檻（測試中 V0.1）
@@ -52,6 +52,10 @@ TH = {
     "rs_min_peers": 3,    # 族群指數至少要有 3 檔同業資料
     # ---- V1.4 新增（積極組，測試中）----
     "aggr_atr_max": 9.0,  # 積極組：ATR14 占股價 4.5%～9% 的個股（超過 9% 仍不適合）
+    # ---- V1.5 新增（回檔布局，測試中）----
+    "dip_stop": 0.20,     # 回檔布局停損：買價 −20%
+    "dip_hold": 60,       # 回檔布局最多持有 60 個交易日（安全上限，到期收盤賣）
+    "dip_live_days": 5,   # dip_mode="first" 時，App 當天顯示：第一次跌到門檻後 5 個交易日內仍算訊號
 }
 
 # 三項過濾的狀態（規則管理：正式採用／測試中／封存）
@@ -64,6 +68,8 @@ FILTERS = {
     "f_market": ("大盤濾網（空頭時股數減半）", "測試中・風控用"),
     "f_sector": ("族群強弱（明顯弱於大盤時等待）", "測試中・回測不支持，預設關"),
     "f_aggr": ("積極組（高波動個股：寬停損 2 ATR、淨利 8% 出場、固定最大損失）", "測試中・回測支持・紙上交易驗證中，預設關"),
+    "f_dip": ("回檔布局（離 60 日高點跌到門檻就買、淨賺 10% 賣、−20% 停損、最多 60 天；不看股性）", "測試中・回測支持"),
+    "dip_idle_0050": ("閒置資金放 0050（資金配置建議）", "測試中・回測支持（帳戶報酬提高，但仍未贏 0050 放著）"),
 }
 
 PATTERNS = {
@@ -76,8 +82,11 @@ PATTERNS = {
 MANUAL_ONLY = {13, 14, 16}  # 尚未自動化，需人工看圖確認
 
 DEFAULT_PARAMS = {
-    "target_net": 3.0,      # 淨獲利目標 %
-    "hold_days": 15,        # 最長持有交易日
+    # 2026-10-27 使用者刪除舊規則「抱 5～15 天、賺 2～3% 全賣」。研究（research/newrule.txt 第六節，App 五種買點）：
+    #   舊 3%・15 天：個股 313 筆 −0.50%、ETF 499 筆 −0.05%；10%・60 天：個股 3,027 筆 −0.02%（前段 −0.18%、後段 +0.28%）、
+    #   ETF 922 筆 +1.99%（前段 +1.34%、後段 +2.23%）→ 前後兩段都改善 → 改為 10%・60 天（測試中・回測支持）。
+    "target_net": 10.0,     # 淨獲利目標 %（短線五種買點）
+    "hold_days": 60,        # 最長持有交易日（安全上限，到期收盤賣）
     "fee_rate": 0.001425,   # 券商手續費率
     "fee_discount": 1.0,    # 手續費折扣（1.0 = 無折扣，0.6 = 6 折）
     "capital": 50000,       # 本次投入上限（元）
@@ -98,6 +107,18 @@ DEFAULT_PARAMS = {
     "aggr_min_rr": 0.3,     # 積極組最低風險報酬比（寬停損下 1.0 幾乎不可能達到）
     "aggr_max_loss": 20000, # 積極組單筆最大損失（元）＝總資金 100 萬的 2%
     "aggr_capital": 300000, # 積極組單筆投入上限（元）
+    # ---- V1.5 回檔布局（測試中）：使用者實戰法量化版；高波動個股也適用（不再一律「不適合」）----
+    # 2026-10-27 研究（research/newrule.txt，416 檔、10 年、還原權息、扣滑價；淨賺 10%／−20% 停損／60 天；區間內都可買）：
+    #   個股 跌 30%：3,696 筆 成功 76%、每筆 +4.01%（樣本外 78%／+4.16%）；跌 35%：2,244 筆 80%／+5.17%（樣本外 82%／+5.21%）
+    #   ETF 跌 20%：262 筆 85%／+7.81%（樣本外 93%／+9.26%）。ATR > 4.5% 的高波動個股成功率反而較高（跌 35%：80%）。
+    #   「區間內都可買」比「第一次跌到才買」訊號多約 4 成、每筆平均也較好（兩段皆然）→ 採用。
+    "f_dip": True,            # 回檔布局開關
+    "dip_drop_stock": 35.0,   # 個股：收盤距近 60 日最高點跌 ≥ 35% 才買
+    "dip_drop_etf": 20.0,     # ETF：跌 ≥ 20% 才買
+    "dip_mode": "zone",       # zone＝還在門檻以下、手上沒有這檔就可買；first＝只在第一次跌到那天
+    "dip_target": 10.0,       # 淨賺 10% 賣
+    "dip_capital": 200000,    # 每筆投入（元）；總資金 100 萬最多同時 5 筆
+    "dip_idle_0050": True,    # 資金配置建議：沒用到的資金放 0050，訊號出現時賣 0050 換現金
 }
 
 
@@ -442,6 +463,37 @@ class Analyzer:
     def tgt(self, i):
         """第 i 天訊號使用的淨利目標 %。"""
         return float(self.p["aggr_target"] if self.aggressive(i) else self.p["target_net"])
+
+    def dip_drop(self):
+        return float(self.p["dip_drop_etf"] if self.etf else self.p["dip_drop_stock"]) / 100
+
+    def dip_level(self, i):
+        """回檔布局觸發價：近 60 日最高點 ×（1 − 門檻）。"""
+        h = self.HI60[i]
+        return float(h * (1 - self.dip_drop())) if np.isfinite(h) else float("nan")
+
+    def dip_signal(self, i, live=True):
+        """回檔布局：收盤距近 60 日最高點跌 ≥ 門檻。回測＝第一次跌到那天；App 當天＝第一次跌到後 5 日內仍在門檻下。"""
+        if not self.p.get("f_dip") or i < 61:
+            return None
+        x = self.dip_drop()
+        dd = self.C / self.HI60 - 1
+        if not (np.isfinite(dd[i]) and dd[i] <= -x):
+            return None
+        first = None
+        for j in range(i, 61, -1):  # 這一段跌勢中第一次跌到門檻的日子
+            if not (np.isfinite(dd[j - 1]) and dd[j - 1] <= -x):
+                first = j
+                break
+        if self.p.get("dip_mode") == "first":
+            if first is None or i - first >= (TH["dip_live_days"] if live else 1):
+                return None
+        first = first if first is not None else i
+        entry = float(self.C[i])
+        return {"type": f"回檔布局買（跌 {x * 100:g}%）", "mode": "close", "entry": entry,
+                "stop": entry * (1 - TH["dip_stop"]), "ref": float(self.HI60[i]), "ids": [], "src": self.dates[first],
+                "dip": True,
+                "note": f"收盤距近 60 日高點 {self.HI60[i]:g} 跌 {-dd[i] * 100:.1f}%（{self.dates[first]} 第一次跌到 {x * 100:g}%）"}
 
     def filter_notes(self, i, sig=None):
         """三項過濾（測試中）的判斷結果。回傳 dict：block（擋下進場的原因）、halve（股數減半原因）、info（說明）。"""
@@ -797,12 +849,15 @@ class Analyzer:
             k = float(self.p["aggr_stop_atr"])
             out = [{**c, "stop": float(min(c["stop"], c["entry"] - k * self.ATR[i])), "aggr": True,
                     "note": (c.get("note", "") + f"；積極組停損 ≥ {k:g} ATR").lstrip("；")} for c in out]
+        dp = self.dip_signal(i, live)  # F. 回檔布局（測試中，不套積極組）
+        if dp:
+            out.append(dp)
         return [c for c in out if c["stop"] < c["entry"]]
 
     def signal(self, i):
         """相容舊介面：回傳風報比最好的候選。"""
         cs = self.candidates(i)
-        return max(cs, key=lambda c: self.plan(i, c["entry"], c["stop"])["rr"]) if cs else None
+        return max(cs, key=lambda c: self.plan(i, c["entry"], c["stop"], c.get("dip", False))["rr"]) if cs else None
 
     def suitability(self, i):
         ap = self.ATRP[i]
@@ -825,19 +880,19 @@ class Analyzer:
             v.append("高檔衰退警報：" + "、".join(dec))
         return v
 
-    def plan(self, i, entry, stop):
-        ag = self.aggressive(i)
-        tgt = self.tgt(i)
-        tp3 = target_price(entry, tgt, self.buy_c, self.sell_c, self.etf)  # 主要停利（積極組為 5%）
-        early = float(self.p["aggr_early"]) if ag else 2.0
+    def plan(self, i, entry, stop, dip=False):
+        ag = self.aggressive(i) and not dip
+        tgt = float(self.p["dip_target"]) if dip else self.tgt(i)
+        tp3 = target_price(entry, tgt, self.buy_c, self.sell_c, self.etf)  # 主要停利
+        early = 5.0 if dip else float(self.p["aggr_early"]) if ag else 2.0
         tp2 = target_price(entry, early, self.buy_c, self.sell_c, self.etf)  # 遇壓力的提早停利
         stop = round_down(stop, self.etf)
         loss_pct = net_return(entry, stop, self.buy_c, self.sell_c)
         rr = tgt / abs(loss_pct) if loss_pct < 0 else float("inf")
         per_share_cost = entry * (1 + self.buy_c)
         per_share_loss = per_share_cost - stop * (1 - self.sell_c)
-        cap = self.p["aggr_capital"] if ag else self.p["capital"]
-        mloss = self.p["aggr_max_loss"] if ag else self.p["max_loss"]
+        cap = self.p["dip_capital"] if dip else self.p["aggr_capital"] if ag else self.p["capital"]
+        mloss = 1e18 if dip else self.p["aggr_max_loss"] if ag else self.p["max_loss"]  # 回檔布局：固定每筆金額
         shares = int(min(cap // per_share_cost,
                          mloss // per_share_loss if per_share_loss > 0 else 1e12))
         res = self.resistance_above(i, entry)
@@ -845,11 +900,14 @@ class Analyzer:
                 "rr": rr, "shares": max(shares, 0), "cost": shares * per_share_cost,
                 "max_loss": shares * per_share_loss,
                 "profit": shares * (tp3 * (1 - self.sell_c) - per_share_cost),
-                "resistance": res, "aggr": ag, "target": tgt, "tp2_pct": early}
+                "resistance": res, "aggr": ag, "target": tgt, "tp2_pct": early, "dip": dip,
+                "hold": int(TH["dip_hold"]) if dip else int(self.p["hold_days"])}
 
     def tradable(self, i, sig, entry=None):
         """風控檢查：否決條件、股性、風報比、上方壓力。回傳 (可否, 原因列表, 計畫)。"""
         entry = sig["entry"] if entry is None else entry
+        if sig.get("dip"):  # 回檔布局：研究顯示「股價還在跌」也有統計優勢，不套否決／股性／風報比／壓力（衝突另列）
+            return True, [], self.plan(i, entry, sig["stop"], dip=True)
         reasons = list(self.vetoes(i))
         su = self.suitability(i)
         if su:
@@ -894,7 +952,7 @@ class Analyzer:
                 return None, None, None
             if self._locked_up(e):
                 return None, None, "漲停買不到"
-            if O[e] > C[i] * (1 + TH["no_chase"]):
+            if O[e] > C[i] * (1 + TH["no_chase"]) and not c.get("dip"):
                 return None, None, "開高不追"
             if O[e] <= stop:
                 return None, None, "開低破停損"
@@ -910,7 +968,11 @@ class Analyzer:
                     break
             if start is None:
                 return (None, None, "限價未成交") if i + TH["limit_valid"] < n else (None, None, None)
-        tp = target_price(entry, self.tgt(i), self.buy_c, self.sell_c, self.etf)
+        if c.get("dip"):
+            stop = round_down(entry * (1 - TH["dip_stop"]), self.etf)  # 依實際進場價重算 −20%
+            hold = int(TH["dip_hold"])
+        tgt = float(self.p["dip_target"]) if c.get("dip") else self.tgt(i)
+        tp = target_price(entry, tgt, self.buy_c, self.sell_c, self.etf)
         last = start + hold - 1
         if last >= n:
             return None, None, None
@@ -919,7 +981,7 @@ class Analyzer:
         for j in range(start, last + 1):
             mae = min(mae, L[j] / entry - 1)
             mfe = max(mfe, H[j] / entry - 1)
-            if O[j] <= stop and (j > start or c["mode"] == "limit"):
+            if O[j] <= stop and (j > start or c["mode"] == "limit" or c.get("dip")):
                 exit_, why, xj = float(min(O[j], entry if j == start else O[j])), "停損（跳空）", j
                 break
             if L[j] <= stop:
@@ -939,7 +1001,7 @@ class Analyzer:
             "結果": why, "淨報酬%": round(net_return(entry, exit_, self.buy_c, self.sell_c), 2),
             "持有天數": xj - start + 1, "最大不利%": round(mae * 100, 2), "最大有利%": round(mfe * 100, 2),
             "買點": c["type"].split("（")[0], "型態": tag,
-            "積極組": bool(c.get("aggr")), "ATR%": round(float(self.ATRP[i]), 2) if np.isfinite(self.ATRP[i]) else None,
+            "積極組": bool(c.get("aggr")), "回檔布局": bool(c.get("dip")), "ATR%": round(float(self.ATRP[i]), 2) if np.isfinite(self.ATRP[i]) else None,
         }, xj, None
 
     def backtest(self):
@@ -1098,15 +1160,22 @@ class Analyzer:
         avail = [m["score"] for m in mods if m["score"] is not None]
         fit = sum(avail) / len(avail) * 100 if avail else 0.0
 
-        if ok and enough and stats["avg"] <= 0:
+        is_dip = bool(sig and sig.get("dip") and ok)
+        if is_dip:  # 回檔布局：只看本股回檔布局的歷史，不和短線買點混在一起
+            dbt = bt[bt["回檔布局"]] if len(bt) and "回檔布局" in bt.columns else bt.iloc[0:0]
+            dst = self.summarize(dbt)
+            if dst["n"] >= 30 and dst["avg"] <= 0:
+                ok = False
+                why.append(f"本股過去 {dst['n']} 筆回檔布局平均報酬為負")
+        elif ok and enough and stats["avg"] <= 0:
             ok = False
             why.append("本股過去同類訊號平均報酬為負")
         early = False
         halve = []
-        if ok and st["score"] == 0.0 and pl:
+        if ok and st["score"] == 0.0 and pl and not is_dip:
             early = True  # 空頭結構中的空轉多突破：積極型買點，部位減半
             halve.append("早期空轉多買點")
-        if ok and pl and fnote["halve"]:
+        if ok and pl and fnote["halve"] and not is_dip:  # 回檔布局常在大盤大跌時出現，研究中不減半
             halve += fnote["halve"]
         if halve and pl:
             pl = dict(pl)
@@ -1116,9 +1185,10 @@ class Analyzer:
             pl["cost"] = pl["shares"] * per
             pl["max_loss"] = pl["shares"] * (per - pl["stop"] * (1 - self.sell_c))
             pl["profit"] = pl["shares"] * (pl["tp3"] * (1 - self.sell_c) - per)
-        unsuitable = self.suitability(i)
+        unsuitable = None if self.p.get("f_dip") else self.suitability(i)  # 有回檔布局時不再判「不適合」
+        su_note = self.suitability(i)
         if ok:
-            tag = "積極組" if pl and pl.get("aggr") else ""
+            tag = "回檔布局" if is_dip else "積極組" if pl and pl.get("aggr") else ""
             mode = "掛單" if sig["mode"] == "limit" else ""
             inner = "・".join(x for x in (tag, mode) if x)
             decision, color = (f"可進場（{inner}）" if inner else "可進場"), "green"
@@ -1138,7 +1208,18 @@ class Analyzer:
             lvl = round_up(min(cands) * 1.0001, self.etf) if cands else round_up(self.H[i] * 1.0001, self.etf)
             conf = st["last_high"] if st["last_high"] and st["last_high"] > lvl else None
             bull = self.MA20[i] > self.MA60[i] and self.MA20[i] > self.MA20[i - 5] and C[i] > self.MA60[i]
-            if unsuitable:
+            dl = self.dip_level(i)
+            dip_txt = ""
+            if self.p.get("f_dip") and np.isfinite(dl):
+                dip_txt = (f"回檔布局（測試中）：收盤跌到 {round_down(dl, self.etf):g} 以下（近 60 日高點 {self.HI60[i]:g} 跌 "
+                           f"{self.dip_drop() * 100:g}%），隔天開盤買 {self.p['dip_capital']:,.0f} 元；淨賺 "
+                           f"{self.p['dip_target']:g}% 賣、跌 {TH['dip_stop'] * 100:g}% 停損、最多 {TH['dip_hold']} 個交易日。"
+                           f"目前距高點 {(C[i] / self.HI60[i] - 1) * 100:+.1f}%。")
+            if su_note and self.p.get("f_dip"):
+                text = (f"這檔股票日均波動約 {self.ATRP[i]:.1f}%，短線突破／回檔買點的停損配不上（{su_note}）。"
+                        f"改用 {dip_txt}")
+                dip_txt = ""
+            elif unsuitable:
                 text = (f"這檔股票日均波動約 {self.ATRP[i]:.1f}%，與「{self.p['hold_days']} 日內淨賺 "
                         f"{self.p['target_net']:g}%」的策略不匹配，系統不提供買點。"
                         f"本策略適合日均波動 {TH['atr_min']}%～{TH['atr_max']}% 的股票。")
@@ -1165,6 +1246,8 @@ class Analyzer:
                 if any("弱勢族群" in b for b in fnote["block"]):
                     text += f" 族群目前明顯弱於大盤，等族群 {TH['rs_days']} 日表現追上大盤（落後不超過 {abs(TH['rs_weak']):g} 個百分點）再考慮。"
                 text += " 觸發當天收盤後再分析一次確認風報比。"
+            if dip_txt:
+                text += " " + dip_txt
             trig = {"price": float(lvl), "vol": vneed, "text": text}
 
         # ---- 理由與風險 ----
@@ -1187,6 +1270,13 @@ class Analyzer:
             conflicts.append("帶量長紅 vs 位在高檔 → 留意高檔出貨換手")
         if early:
             conflicts.append("型態突破 vs 仍是空頭結構 → 屬早期空轉多（積極型）買點，部位已自動減半")
+        if is_dip:
+            vt = self.vetoes(i)
+            conflicts.append("回檔布局 vs 價格結構／破底否決 → 依使用者需求 v2.0 與 10 年回測，跌到統計優勢區間可提前布局；"
+                             "其餘短線否決不套用，改用寬停損 −20% 與固定每筆金額控制風險（測試中）"
+                             + (f"。目前短線否決：{'；'.join(vt)}" if vt else ""))
+            if su_note:
+                conflicts.append(f"股性 vs 回檔布局 → {su_note}；回檔布局不看股性")
         if pl and pl.get("aggr"):
             conflicts.append(f"高波動個股（ATR {self.ATRP[i]:.1f}%）→ 積極組：停損放寬、淨利 {pl['target']:g}% 出場、"
                              f"單筆最大損失 {self.p['aggr_max_loss']:,.0f} 元以內（測試中，尚未證實有優勢）")
@@ -1211,4 +1301,8 @@ class Analyzer:
             "costs": (self.buy_c, self.sell_c), "funnel": getattr(self, "funnel", {}),
             "atrp": float(self.ATRP[i]) if np.isfinite(self.ATRP[i]) else None, "candidates": cands,
             "filters": fnote, "filter_flags": {k: bool(self.p.get(k)) for k in FILTERS},
+            "dip_level": self.dip_level(i), "dip_drop": self.dip_drop() * 100,
+            "dist_high": float(C[i] / self.HI60[i] - 1) * 100 if np.isfinite(self.HI60[i]) else None,
+            "idle_note": (f"資金配置（測試中）：總資金中沒有用在訊號上的部分，建議放 0050；出現回檔布局訊號時，"
+                          f"賣出 {self.p['dip_capital']:,.0f} 元的 0050 換成這筆。" if self.p.get("dip_idle_0050") else ""),
         }

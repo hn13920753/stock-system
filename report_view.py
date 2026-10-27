@@ -21,8 +21,9 @@ def render_report(r, an, df, src, target, hold, title=None):
     # ---------------- 標頭 ----------------
     st.markdown(f"**{code}**　收盤 **{price(r['close'])}**（{r['chg']:+.2f}%）・量 {money(r['volume'])} 張・{r['date']}")
     st.caption(f"資料：{src}・{len(df)} 根日K（{df.index[0]:%Y-%m-%d} 起）"
-               + (f"・股性 ATR {r['atrp']:.1f}%（本策略適用 {E.TH['atr_min']}～{E.TH['atr_max']}%）"
-                  if r.get("atrp") else ""))
+               + (f"・股性 ATR {r['atrp']:.1f}%（短線買點適用 {E.TH['atr_min']}～{E.TH['atr_max']}%；回檔布局不限）"
+                  if r.get("atrp") else "")
+               + (f"・距近 60 日高點 {r['dist_high']:+.1f}%" if r.get("dist_high") is not None else ""))
     if r["stale_days"] > 5:
         st.warning(f"最新資料距今 {r['stale_days']} 天，可能不是最新行情。")
 
@@ -49,7 +50,7 @@ def render_report(r, an, df, src, target, hold, title=None):
         win_val = f"{s['tp_rate']:.0f}%"
         win_note = (f"{s['n']} 筆中先到停利 {round(s['tp_rate'] * s['n'] / 100)} 筆"
                     + ("" if r["enough"] else "・樣本 < 30，僅供參考"))
-    k1.markdown(f'<div class="kpi"><div class="lab">歷史回測勝率（{hold} 日內先到 +{target:g}%）</div>'
+    k1.markdown(f'<div class="kpi"><div class="lab">歷史回測勝率（先到停利）</div>'
                 f'<div class="val">{win_val}</div><div class="note">{win_note}</div></div>', unsafe_allow_html=True)
     k2.markdown(f'<div class="kpi"><div class="lab">規則符合度（不是勝率）</div>'
                 f'<div class="val">{r["fit"]:.0f}%</div><div class="note">10 模組中可判定者的平均</div></div>',
@@ -78,26 +79,35 @@ def render_report(r, an, df, src, target, hold, title=None):
             (("限價掛單", f"{price(pl['entry'])}（{r['signal'].get('days_left', 3)} 個交易日內有效；開盤低於此價就以開盤價成交；"
                           f"未成交前收盤跌破 {price(pl['stop'])} 就取消）")
              if r["signal"].get("mode") == "limit" else
-             ("買進價", f"約 {price(pl['entry'])}（明日開盤高於 {price(E.round_up(pl['entry'] * 1.01, r['etf']))} 就不追）")),
+             ("買進價", f"約 {price(pl['entry'])}（明日開盤買；回檔布局不設不追價）" if pl.get("dip") else
+                       f"約 {price(pl['entry'])}（明日開盤高於 {price(E.round_up(pl['entry'] * 1.01, r['etf']))} 就不追）")),
             ("買進數量", f"{qty}（約 {money(pl['cost'])} 元）{half}"),
             ("停利", f"{price(pl['tp3'])}（淨 +{pl.get('target', target):g}% 全出）；遇壓力可改 {price(pl['tp2'])}（淨 +{pl.get('tp2_pct', 2.0):g}%）"),
             ("停損", f"{price(pl['stop'])}（碰到即出，建議設觸價停損單；淨 {pl['loss_pct']:.2f}%）"),
             ("最大損失", f"約 {money(pl['max_loss'])} 元"),
             ("風險報酬比", f"{pl['rr']:.2f}"),
             ("前方壓力", price(pl["resistance"]) if pl["resistance"] else "近 120 日內無"),
-            ("最晚出場", f"第 {hold} 個交易日收盤"),
-            ("撤退條件", "跌破停損、爆量長黑、跌回突破價之下（假突破）"),
+            ("最晚出場", f"第 {pl.get('hold', hold)} 個交易日收盤"),
+            ("撤退條件", "跌破停損（買價 −20%）、滿 60 個交易日未達標以收盤賣" if pl.get("dip")
+             else "跌破停損、爆量長黑、跌回突破價之下（假突破）"),
         ]
+        if pl.get("dip"):
+            st.info(f"🪂 回檔布局（測試中・回測支持）：股價還在跌也可以買，停損放寬到 −20%、淨賺 {pl.get('target', 10):g}% 賣、"
+                    "每筆固定金額。歷史上約每 4 筆有 1 筆中途曾浮虧 15% 以上，買之前要能接受。")
         if pl.get("aggr"):
             st.info(f"⚡ 積極組（測試中）：高波動個股，停損放寬到 2 ATR、淨利 {pl.get('target', 8):g}% 出場，"
                     "股數依「單筆最大損失」反推。尚未證實有優勢，正在紙上交易驗證。")
         st.table(pd.DataFrame(rows, columns=["項目", "內容"]).set_index("項目"))
+        if r.get("idle_note") and pl.get("dip"):
+            st.caption("💰 " + r["idle_note"])
         if pl["shares"] == 0:
             st.warning("依目前資金與最大損失設定，買不到 1 股，請調整進階設定。")
     else:
         st.markdown("#### 下一步")
         if r["trigger"]:
             st.write("**觸發條件：** " + r["trigger"]["text"])
+        if r.get("idle_note"):
+            st.caption("💰 " + r["idle_note"])
         st.caption("觸發當天收盤後再分析一次，系統會算出停損、數量與停利。")
 
     # ---------------- 理由 / 風險 / 衝突 ----------------
@@ -142,11 +152,11 @@ def render_report(r, an, df, src, target, hold, title=None):
             st.write(f"期間 {s['first']} ～ {s['last']}，共 {s['n']} 筆；先停利 {s['tp_rate']:.0f}%、"
                      f"先停損 {s['sl_rate']:.0f}%、淨報酬為正 {s['win_rate']:.0f}%；最大不利波動 {s['worst_mae']:.1f}%。")
             cols = [c for c in ["訊號日", "買點", "進場價", "停損", "停利", "出場日", "結果", "淨報酬%", "持有天數",
-                                "停損/ATR", "大盤", "型態"] if c in bt.columns]
+                                "停損/ATR", "大盤", "型態", "回檔布局"] if c in bt.columns]
             st.dataframe(bt[cols].iloc[::-1], hide_index=True, use_container_width=True)
         st.caption("方法：每天收盤後判斷訊號。收盤型買點隔日開盤進場，開盤高於前收 1% 不追、漲停鎖死買不到；"
                    "掛單型買點 3 個交易日內觸價成交，成交當天只算停損不算停利。逐日檢查，同一天同時碰到停損與停利先算停損；"
-                   "跳空跌破停損以開盤價計算；持有期滿以收盤出場。已扣手續費與證交稅，未含滑價。過去結果不保證未來。")
+                   "跳空跌破停損以開盤價計算；持有期滿以收盤出場（回檔布局最多 60 天、停損 −20%、不設不追價）。已扣手續費與證交稅，未含滑價。過去結果不保證未來。")
 
     # ---------------- K 線圖 ----------------
     try:
